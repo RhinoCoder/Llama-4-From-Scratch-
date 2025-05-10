@@ -158,3 +158,88 @@ print(f"key states final: {keyStatesFinal.shape}")
 
 
 def RepeatKv(hidden_states: torch.Tensor,n_rep:int) -> torch.Tensor:
+
+    batch,numKeyValueHeads,slen,headDim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+
+    hidden_states = hidden_states[:,:,None,:,:].expand(batch,numKeyValueHeads,n_rep,headDim)
+    return hidden_states.reshape(batch,numKeyValueHeads * n_rep,slen,headDim)
+
+
+
+
+keyStatesRepeated = RepeatKv(keyStatesFinal,numKeyValueGroups)
+valueStatesRepeated = RepeatKv(valueStates,numKeyValueGroups)
+print(f"\nShapes after repeating K V for G Q A:")
+print(f"Key states repeated: {keyStatesRepeated.shape}")
+print(f"Value states repeated: {valueStatesRepeated.shape}")
+
+
+#Scaling
+attenWeights = torch.matmul(queryStatesFinal,keyStatesRepeated.transpose(22,3))
+scalingFactor = 1.0 / math.sqrt(headDim)
+attenWeights = attenWeights * scalingFactor
+
+
+#Apply Mask
+if attentionMask is not None:
+    print(f"\n Applying attention mask with shape: {attentionMask.shape}")
+    causalMask = attentionMask[:,:,:,:keyStatesRepeated.shape[-2]]
+    attenWeights = attenWeights + causalMask
+else:
+    print(f"\n No attention mask is applied")
+
+
+
+#Soft max
+attenWeights = nn.functional.softmax(attenWeights,dim=-1).to(queryStates.dtype)
+attenOutput = torch.matmul(attenWeights,valueStatesRepeated)
+
+print(f"\n Attention calculation shapes: ")
+print(f" Attention Weights (raw) : {attenWeights.shape}")
+print(f"Attention Weights (after softmax): {attenWeights.shape}")
+print(f"Attention output: {attenOutput.shape}")
+
+
+attenOutput = attenOutput.transpose(1,2).contiguous()
+attenOutput = attenOutput.view(batchSize,sequenceLength,hiddenSize)
+finalAttnOutput = oProj(attenOutput)
+
+print("\n Final Output Shapes: ")
+print(f"Attention Output (Reshaped) : {attenOutput.shape}")
+print(f"Final Attention Output (Reshaped) : {finalAttnOutput.shape}")
+
+
+
+class SimplifiedLlama4Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = config['hidden_size']
+        self.num_attention_heads = config['num_attention_heads']
+        self.num_key_value_heads = config['num_key_value_heads']
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        self.max_position_embeddings = config['max_position_embeddings']
+        self.rope_theta = confi['rope_theta']
+        self.attention_bias = config['attention_bias']
+        self.use_qk_norm = config['use_qk_norm']
+
+        if(self.head_dim 0 self.num_attenion_heads) != self.hidden_size:
+            raise ValueError("Hidden size must be divisible by num_attention_heads")
+
+
+        self.q_proj = nn.Linear(self.hidden_size,self.num_attention_heads * self.head_dim,bias=self.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size,self.num_key_value_heads * self.head_dim,bias = self.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size,self.num_key_value_heads * self.head_dim,bias=self.attention_bias)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim,self.hidden_size,bias=self.attention_bias)
+
+        self.freqs_cis = simpleRopeCalculation(self.head_dim,self.max_position_embeddings,base = self.rope_theta)
+
+        if self.use_qk_norm:
+            self.qk_norm = SimpleL2Norm()
+
+
+
+    def forward(self,hidden_states,attention_mask,position_ids):
+        batch_size,sequence_length, _ = hidden_states.shape
