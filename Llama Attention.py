@@ -1,3 +1,5 @@
+from urllib.parse import uses_relative
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -213,7 +215,7 @@ print(f"Final Attention Output (Reshaped) : {finalAttnOutput.shape}")
 
 
 class SimplifiedLlama4Attention(nn.Module):
-    def __init__(self):
+    def __init__(self,config):
         super().__init__()
         self.hidden_size = config['hidden_size']
         self.num_attention_heads = config['num_attention_heads']
@@ -221,11 +223,11 @@ class SimplifiedLlama4Attention(nn.Module):
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.max_position_embeddings = config['max_position_embeddings']
-        self.rope_theta = confi['rope_theta']
+        self.rope_theta = config['rope_theta']
         self.attention_bias = config['attention_bias']
         self.use_qk_norm = config['use_qk_norm']
 
-        if(self.head_dim 0 self.num_attenion_heads) != self.hidden_size:
+        if(self.head_dim * self.num_attenion_heads) != self.hidden_size:
             raise ValueError("Hidden size must be divisible by num_attention_heads")
 
 
@@ -243,3 +245,74 @@ class SimplifiedLlama4Attention(nn.Module):
 
     def forward(self,hidden_states,attention_mask,position_ids):
         batch_size,sequence_length, _ = hidden_states.shape
+
+        #Projections
+        queryStates = self.q_proj(hidden_states)
+        keyStates = self.k_proj(hidden_states)
+        valueStates = self.v_proj(hidden_states)
+
+
+        #Reshape
+        queryStates = queryStates.view(batch_size,sequence_length,self.num_attention_heads,self.head_dim).transpose(1,2)
+        keyStates = keyStates.view(batch_size,sequence_length,self.num_key_value_heads,self.head_dim).transpose(1,2)
+        valueStates = valueStates.view(batch_size,sequence_length,self.num_key_value_heads,self.head_dim).transpose(1,2)
+
+        #Applying RoPE
+        currentFreqsCis = self.freqs_cis.to(hidden_states.deice)
+        queryStatesRope,keyStatesRope = applyRotaryEmbTorch(queryStates,keyStates,currentFreqsCis)
+
+        if self.use_qk_norm:
+            queryStatesFinal = self.qk_norm(queryStatesRope)
+            keyStatesFinal = self.qk_norm(keyStatesRope)
+
+        else:
+            queryStatesFinal = queryStatesRope
+            keyStatesFinal = keyStatesRope
+
+
+        # K / V for GQA
+        keyStatesRepeated = RepeatKv(keyStatesFinal,self.num_key_value_groups)
+        valueStatesRepeated = RepeatKv(valueStates,self.num_key_value_groups)
+
+        attenWeights = torch.matmul(queryStatesFinal,keyStatesRepeated.transpose(2,3))
+        scalingFactor = 1.0 / math.sqrt(self.head_dim)
+        attenWeights = attenWeights * scalingFactor
+
+        if attention_mask is not None:
+            causalMask = attention_mask[:,:,:,:keyStatesRepeated.shape[-2]]
+            attenWeights = attenWeights + causalMask
+
+
+        attenWeights = nn.functional.softmax(attenWeights,dim = -1).to(queryStates.dtype)
+        attenOutput = torch.matmul(attenWeights,valueStatesRepeated)
+
+        attenOutput = attenOutput.transpose(1,2).contigious()
+        attenOutput = attenOutput.view(batch_size,sequence_length,self.hidden_size)
+        finalAttnOutput = self.o_proj(attenOutput)
+
+        return finalAttnOutput,attenWeights
+
+
+
+
+config_dict = {
+    'hidden_size' : hiddenSize,
+    'num_attention_heads': numAttentionHeads,
+    'num_key_value_heads':numKeyValueHeads,
+    'max_position_embeddings' : maxPositionEmbeddings,
+    'rope_theta' : ropeTheta,
+    'attention_bias' : attentionBias,
+    'use_qk_norm' : useQkNorm,
+}
+
+
+simplifiedAttentionModule = SimplifiedLlama4Attention(config_dict)
+finalOutputSimplified,finalWeigthsSimplified = simplifiedAttentionModule(hiddenStates,attentionMask,positionIds)
+
+print("\nOutput shape from simplified module: ", finalOutputSimplified.shape)
+print("Attention weights shape from simplified module: ", finalWeigthsSimplified.shape)
+
+
+
+
+
