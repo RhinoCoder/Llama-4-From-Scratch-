@@ -1,14 +1,9 @@
-from urllib.parse import uses_relative
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 from typing import  Tuple,Optional
-
-#2.33.35
-
 
 
 hiddenSize = 128
